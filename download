@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# Segredos
+.env
+
+# Dados gerados (determinísticos: recrie com `analista-sql gerar-dados`)
+data/*.db
+
+# JSON detalhado da avaliação (o relatório .md é versionado)
+evals/ultimo_resultado.json
+
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

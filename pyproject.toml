@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analista-sql-delivery"
+version = "0.1.0"
+description = "Pergunta em português vira SQL validado, com tabela e gráfico, sobre dados sintéticos de delivery. Acurácia medida pela execução da query."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rafael Fernandes de Souza Pedra" }]
+dependencies = ["matplotlib>=3.7"]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.40"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+analista-sql = "analista_sql.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning"]
