@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[2]
-MODELO_PADRAO = "llama-3.3-70b-versatile"
+MODELO_PADRAO = "openai/gpt-oss-120b"
 
 
 def carregar_env(caminho: Path | None = None) -> None:
