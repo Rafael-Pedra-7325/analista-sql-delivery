@@ -22,7 +22,7 @@ def executor(db_path):
 
 
 class ClienteFalso:
-    """Imita `openai.OpenAI()` (endpoint xAI Grok) devolvendo respostas pré-programadas de tool call."""
+    """Imita `openai.OpenAI()` (endpoint Groq) devolvendo respostas pré-programadas de tool call."""
 
     def __init__(self, *respostas: dict):
         self.respostas = list(respostas)
