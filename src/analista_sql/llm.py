@@ -1,28 +1,31 @@
 """Camada de LLM: traduz pergunta em linguagem natural para SQL via Claude (Anthropic API).
 
-Usa tool use forçado (`tool_choice={"type": "tool", "name": "gerar_sql"}`) para garantir
-resposta estruturada com SQL, explicação curta e sugestão de gráfico.
+Usa tool use forçado (`tool_choice={"type": "tool", "name": "gerar_sql"}`) e prompt caching
+do contexto do esquema para garantir resposta estruturada (SQL, explicação, gráfico ou recusa).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .config import Config
+from .config import MODELO_PADRAO
+from .modelos import ErroProvedor, Geracao, Tentativa
 
 FERRAMENTA = {
     "name": "gerar_sql",
     "description": (
-        "Gera uma única consulta SELECT em SQLite para responder à pergunta de negócio. "
-        "Nunca usa comandos de escrita nem multi-statements."
+        "Gera uma única consulta SELECT em SQLite para responder à pergunta de negócio, "
+        "ou recusa quando a pergunta pede escrita, previsão ou dados inexistentes no esquema."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "sql": {
-                "type": "string",
-                "description": "Consulta SELECT SQLite completa, válida e somente leitura.",
+                "type": ["string", "null"],
+                "description": (
+                    "Consulta SELECT (ou WITH ... SELECT) SQLite válida e somente leitura, "
+                    "ou null quando a pergunta deve ser recusada."
+                ),
             },
             "explicacao": {
                 "type": "string",
@@ -30,11 +33,15 @@ FERRAMENTA = {
             },
             "grafico": {
                 "type": "string",
-                "enum": ["nenhum", "barra", "linha"],
+                "enum": ["nenhum", "barra", "linha", "dispersao"],
                 "description": (
-                    "Tipo de visualização sugerida: 'linha' para séries temporais, "
-                    "'barra' para categorias/rankings, 'nenhum' para valor único ou tabela."
+                    "Visualização sugerida: 'linha' para séries temporais, 'barra' para "
+                    "categorias/rankings, 'dispersao' para duas métricas numéricas, 'nenhum' caso contrário."
                 ),
+            },
+            "motivo_recusa": {
+                "type": ["string", "null"],
+                "description": "Explicação curta em português quando sql for null; caso contrário, null.",
             },
         },
         "required": ["sql", "explicacao", "grafico"],
@@ -46,32 +53,15 @@ Converta a pergunta do usuário em UMA única consulta SELECT para o banco descr
 
 Regras obrigatórias:
 - Gere APENAS SELECT (ou WITH ... SELECT). Nunca use INSERT, UPDATE, DELETE, DROP, ALTER, PRAGMA ou ATTACH.
-- Use somente as tabelas e colunas documentadas no schema.
-- Em SQLite, para datas use strftime('%Y-%m', coluna) ou date(coluna).
-- Prefira nomes de colunas claros em português (ex.: total_pedidos, receita_total) usando AS.
-- Sempre aplique um limite razoável (ex.: LIMIT 20) em rankings e listagens.
-- Se a pergunta for ambígua, faça a escolha mais útil para negócios e registre na explicação.
-
-Schema do banco:
-{schema}
-"""
-
-
-@dataclass
-class RespostaLLM:
-    sql: str
-    explicacao: str
-    grafico: str  # "nenhum" | "barra" | "linha"
-
-
-@dataclass
-class Tentativa:
-    sql: str
-    erro: str
+- Se o usuário pedir alteração/remoção de dados, dados pessoais inexistentes (nome, CPF, telefone, e-mail, endereço), lucro/custo ou previsões futuras, devolva sql = null e explique o motivo em motivo_recusa.
+- Siga estritamente as regras de negócio, a grafia exata dos valores válidos e as convenções de saída listadas no contexto.
+- Use somente as tabelas e colunas documentadas no esquema."""
 
 
 class GeradorSQL(Protocol):
-    def gerar(self, pergunta: str, schema: str, tentativas: list[Tentativa]) -> RespostaLLM: ...
+    nome: str
+
+    def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao: ...
 
 
 def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[str, Any]]:
@@ -85,7 +75,7 @@ def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[st
                 "type": "tool_use",
                 "id": tool_id,
                 "name": FERRAMENTA["name"],
-                "input": {"sql": t.sql, "explicacao": "", "grafico": "nenhum"},
+                "input": {"sql": t.sql, "explicacao": "", "grafico": "nenhum", "motivo_recusa": None},
             }],
         })
         mensagens.append({
@@ -95,7 +85,7 @@ def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[st
                 "tool_use_id": tool_id,
                 "content": (
                     f"Essa consulta falhou com o erro: {t.erro}\n"
-                    "Corrija e chame a ferramenta gerar_sql novamente."
+                    "Corrija o SQL usando apenas tabelas e colunas do esquema e chame gerar_sql novamente."
                 ),
                 "is_error": True,
             }],
@@ -104,34 +94,64 @@ def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[st
 
 
 class GeradorClaude:
-    """Chama a API da Anthropic com tool use forçado."""
+    """Chama a API da Anthropic com tool use forçado e prompt caching do esquema."""
 
-    def __init__(self, config: Config, cliente: Any | None = None) -> None:
-        self.config = config
+    def __init__(
+        self,
+        api_key: str | None,
+        modelo: str = MODELO_PADRAO,
+        cliente: Any | None = None,
+    ) -> None:
+        self.modelo = modelo
+        self.nome = f"claude:{modelo}"
         if cliente is not None:
             self._cliente = cliente
         else:
-            if not config.api_key:
-                raise RuntimeError("ANTHROPIC_API_KEY não configurada.")
-            import anthropic  # import preguiçoso para não exigir rede/chave nos testes
+            if not api_key:
+                raise ErroProvedor("ANTHROPIC_API_KEY não configurada.")
+            try:
+                import anthropic
+            except ImportError as exc:
+                raise ErroProvedor(
+                    "Pacote 'anthropic' não instalado. Rode: pip install -e \".[claude]\""
+                ) from exc
+            self._cliente = anthropic.Anthropic(api_key=api_key)
 
-            self._cliente = anthropic.Anthropic(api_key=config.api_key)
+    def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao:
+        try:
+            resposta = self._cliente.messages.create(
+                model=self.modelo,
+                max_tokens=1024,
+                system=[
+                    {
+                        "type": "text",
+                        "text": f"{SYSTEM_PROMPT}\n\n{contexto}",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[FERRAMENTA],
+                tool_choice={"type": "tool", "name": "gerar_sql"},
+                messages=montar_mensagens(pergunta, tentativas),
+            )
+        except Exception as exc:
+            raise ErroProvedor(f"Falha ao consultar a API da Anthropic: {exc}") from exc
 
-    def gerar(self, pergunta: str, schema: str, tentativas: list[Tentativa]) -> RespostaLLM:
-        resposta = self._cliente.messages.create(
-            model=self.config.modelo,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT.format(schema=schema),
-            tools=[FERRAMENTA],
-            tool_choice={"type": "tool", "name": "gerar_sql"},
-            messages=montar_mensagens(pergunta, tentativas),
-        )
         for bloco in resposta.content:
             if getattr(bloco, "type", None) == "tool_use" and bloco.name == "gerar_sql":
-                dados = bloco.input
-                return RespostaLLM(
-                    sql=str(dados.get("sql", "")).strip(),
-                    explicacao=str(dados.get("explicacao", "")).strip(),
-                    grafico=str(dados.get("grafico", "nenhum")).strip() or "nenhum",
+                dados = bloco.input or {}
+                raw_sql = dados.get("sql")
+                sql = None if raw_sql is None or not str(raw_sql).strip() else str(raw_sql).strip()
+                explicacao = str(dados.get("explicacao", "")).strip()
+                grafico = dados.get("grafico")
+                grafico_limpo = str(grafico).strip() if grafico else None
+                motivo = dados.get("motivo_recusa")
+                motivo_recusa = str(motivo).strip() if motivo else None
+                if sql is None and not motivo_recusa:
+                    motivo_recusa = explicacao or "Pergunta fora do escopo dos dados disponíveis."
+                return Geracao(
+                    sql=sql,
+                    explicacao=explicacao,
+                    grafico=grafico_limpo,
+                    motivo_recusa=motivo_recusa,
                 )
-        raise RuntimeError("O modelo Claude não retornou a chamada esperada da ferramenta gerar_sql.")
+        raise ErroProvedor("O modelo Claude não retornou a chamada esperada da ferramenta gerar_sql.")
