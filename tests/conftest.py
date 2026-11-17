@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -21,18 +22,23 @@ def executor(db_path):
 
 
 class ClienteFalso:
-    """Imita `anthropic.Anthropic()` devolvendo respostas pré-programadas de tool use."""
+    """Imita `openai.OpenAI()` (endpoint xAI Grok) devolvendo respostas pré-programadas de tool call."""
 
     def __init__(self, *respostas: dict):
         self.respostas = list(respostas)
         self.chamadas: list[dict] = []
-        self.messages = SimpleNamespace(create=self._criar)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._criar))
 
     def _criar(self, **kwargs):
         self.chamadas.append(kwargs)
         dados = self.respostas.pop(0)
-        bloco = SimpleNamespace(type="tool_use", name="gerar_sql", input=dados)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text="..."), bloco])
+        chamada = SimpleNamespace(
+            id=f"call_{len(self.chamadas)}",
+            type="function",
+            function=SimpleNamespace(name="gerar_sql", arguments=json.dumps(dados, ensure_ascii=False)),
+        )
+        mensagem = SimpleNamespace(content=None, tool_calls=[chamada])
+        return SimpleNamespace(choices=[SimpleNamespace(message=mensagem)])
 
 
 @pytest.fixture()
