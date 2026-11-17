@@ -1,91 +1,102 @@
-from types import SimpleNamespace
+import os
 
 import pytest
 
-from analista_sql.baseline import GeradorBaseline
 from analista_sql.config import Config, carregar_env
-from analista_sql.dados import gerar_banco
-from analista_sql.llm import GeradorClaude, RespostaLLM, Tentativa, montar_mensagens
-from analista_sql.pipeline import PipelineAnalista
+from analista_sql.llm import GeradorClaude, montar_mensagens
+from analista_sql.modelos import ErroProvedor, Geracao, Tentativa
+from analista_sql.offline import GeradorOffline
+from analista_sql.pipeline import Analista, criar_gerador
+from analista_sql.schema import carregar_catalogo
 
 
-@pytest.fixture()
-def banco(tmp_path):
-    db = tmp_path / "delivery.db"
-    gerar_banco(db, n_pedidos=80, seed=7)
-    return db
-
-
-def test_pipeline_com_baseline_responde_todas_as_perguntas(banco):
-    cfg = Config(db_path=banco, api_key=None, modelo="m")
-    pipe = PipelineAnalista(cfg)
+def test_pipeline_offline_responde_perguntas_principais(executor):
+    analista = Analista(executor, GeradorOffline(carregar_catalogo(executor.meta)))
     for pergunta in [
         "Quantos pedidos foram entregues?",
-        "Faturamento mensal",
+        "Faturamento mês a mês",
         "Top 5 restaurantes por faturamento",
         "Ticket médio por categoria",
         "Tempo médio de entrega por cidade",
         "Taxa de cancelamento",
     ]:
-        res = pipe.perguntar(pergunta)
-        assert res.sucesso, f"Falhou para '{pergunta}': {res.erro}"
-        assert res.provedor == "baseline"
+        res = analista.perguntar(pergunta)
+        assert res.ok, f"Falhou para '{pergunta}': {res.erro or res.recusa}"
+        assert res.provedor == "offline:regras"
         assert len(res.linhas) >= 1
 
 
-def test_autocorrecao_recupera_de_sql_invalido_na_primeira_tentativa(banco):
-    class GeradorQueErraUmaVez:
-        def __init__(self):
-            self.chamadas = 0
+def test_autocorrecao_recupera_de_sql_invalido_na_primeira_tentativa(executor, cliente_falso):
+    cliente = cliente_falso(
+        {"sql": "SELECT coluna_inexistente FROM pedidos", "explicacao": "tentativa 1", "grafico": "nenhum"},
+        {"sql": "SELECT COUNT(*) AS total FROM pedidos", "explicacao": "tentativa 2", "grafico": "nenhum"},
+    )
+    gerador = GeradorClaude("sk-teste", "claude-sonnet-4-6", cliente=cliente)
+    analista = Analista(executor, gerador, max_tentativas=3)
 
-        def gerar(self, pergunta, schema, tentativas):
-            self.chamadas += 1
-            if self.chamadas == 1:
-                return RespostaLLM("SELECT coluna_inexistente FROM pedidos", "tentativa 1", "nenhum")
-            assert len(tentativas) == 1
-            assert "no such column" in tentativas[0].erro
-            return RespostaLLM("SELECT COUNT(*) AS total FROM pedidos", "tentativa 2", "nenhum")
-
-    cfg = Config(db_path=banco, api_key=None, modelo="m")
-    pipe = PipelineAnalista(cfg, gerador=GeradorQueErraUmaVez())
-    res = pipe.perguntar("quantos pedidos?")
-    assert res.sucesso and res.tentativas == 2 and res.linhas == [(80,)]
+    res = analista.perguntar("quantos pedidos?")
+    assert res.ok
+    assert len(res.tentativas) == 1
+    assert "no such column" in res.tentativas[0].erro
+    assert len(res.linhas) == 1 and res.linhas[0][0] > 0
+    assert len(cliente.chamadas) == 2
 
 
-def test_pipeline_falha_apos_esgotar_tentativas(banco):
-    class GeradorSempreQuebrado:
-        def gerar(self, pergunta, schema, tentativas):
-            return RespostaLLM("SELECT * FROM tabela_que_nao_existe", "ruim", "nenhum")
+def test_erro_de_validacao_nao_tenta_novamente(executor, cliente_falso):
+    cliente = cliente_falso(
+        {"sql": "DELETE FROM pedidos", "explicacao": "apagar", "grafico": "nenhum"},
+        {"sql": "SELECT 1", "explicacao": "não deve ser chamado", "grafico": "nenhum"},
+    )
+    gerador = GeradorClaude("sk-teste", "claude-sonnet-4-6", cliente=cliente)
+    analista = Analista(executor, gerador, max_tentativas=3)
 
-    cfg = Config(db_path=banco, api_key=None, modelo="m")
-    pipe = PipelineAnalista(cfg, gerador=GeradorSempreQuebrado())
-    res = pipe.perguntar("algo")
-    assert not res.sucesso and res.tentativas == 3 and "no such table" in res.erro
+    res = analista.perguntar("apague os pedidos")
+    assert not res.ok
+    assert len(res.tentativas) == 1
+    assert res.tentativas[0].tipo == "validacao"
+    assert len(cliente.chamadas) == 1
 
 
-def test_claude_extrai_a_chamada_de_ferramenta():
-    chamadas = []
+def test_pipeline_falha_apos_esgotar_tentativas(executor, cliente_falso):
+    cliente = cliente_falso(
+        {"sql": "SELECT * FROM tabela_que_nao_existe", "explicacao": "1", "grafico": "nenhum"},
+        {"sql": "SELECT * FROM tabela_que_nao_existe", "explicacao": "2", "grafico": "nenhum"},
+        {"sql": "SELECT * FROM tabela_que_nao_existe", "explicacao": "3", "grafico": "nenhum"},
+    )
+    gerador = GeradorClaude("sk-teste", "claude-sonnet-4-6", cliente=cliente)
+    analista = Analista(executor, gerador, max_tentativas=3)
 
-    class ClienteFalso:
-        class messages:
-            @staticmethod
-            def create(**kwargs):
-                chamadas.append(kwargs)
-                return SimpleNamespace(
-                    content=[
-                        SimpleNamespace(
-                            type="tool_use",
-                            name="gerar_sql",
-                            input={"sql": "SELECT 1 AS ok", "explicacao": "teste", "grafico": "nenhum"},
-                        )
-                    ]
-                )
+    res = analista.perguntar("algo")
+    assert not res.ok
+    assert len(res.tentativas) == 3
+    assert res.erro and "no such table" in res.erro
 
-    cfg = Config(db_path=None, api_key="sk-teste", modelo="claude-sonnet-4-6")  # type: ignore[arg-type]
-    g = GeradorClaude(cfg, cliente=ClienteFalso())
-    r = g.gerar("pergunta", "schema", [])
-    assert r == RespostaLLM(sql="SELECT 1 AS ok", explicacao="teste", grafico="nenhum")
-    assert chamadas[0]["messages"] == [{"role": "user", "content": "pergunta"}]
+
+def test_claude_extrai_sql_e_recusa(cliente_falso):
+    cliente = cliente_falso(
+        {"sql": "SELECT 1 AS ok", "explicacao": "teste", "grafico": "nenhum", "motivo_recusa": None},
+        {"sql": None, "explicacao": "recusa", "grafico": "nenhum", "motivo_recusa": "CPF não existe no banco."},
+    )
+    g = GeradorClaude("sk-teste", "claude-sonnet-4-6", cliente=cliente)
+    assert g.nome == "claude:claude-sonnet-4-6"
+
+    r1 = g.gerar("pergunta", "schema", [])
+    assert r1 == Geracao(sql="SELECT 1 AS ok", explicacao="teste", grafico="nenhum", motivo_recusa=None)
+    assert cliente.chamadas[0]["messages"] == [{"role": "user", "content": "pergunta"}]
+
+    r2 = g.gerar("qual o cpf?", "schema", [])
+    assert r2.sql is None and r2.motivo_recusa == "CPF não existe no banco."
+
+
+def test_claude_sem_chave_levanta_erro_provedor():
+    with pytest.raises(ErroProvedor):
+        GeradorClaude(None, "claude-sonnet-4-6")
+
+
+def test_criar_gerador_auto_escolhe_offline_sem_chave(executor):
+    cfg = Config(db_path=executor.meta, api_key=None, modelo="claude-sonnet-4-6")  # type: ignore[arg-type]
+    g = criar_gerador("auto", cfg, executor)
+    assert g.nome == "offline:regras"
 
 
 def test_historico_de_autocorrecao_inclui_sql_e_erro():
@@ -106,6 +117,7 @@ def test_carregar_env_nao_sobrescreve(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("FOO_TESTE", raising=False)
     carregar_env(arq)
-    import os
 
-    assert os.environ["ANTHROPIC_API_KEY"] == "abc" and os.environ["FOO_TESTE"] == "bar" and os.environ["JA_DEFINIDA"] == "antiga"
+    assert os.environ["ANTHROPIC_API_KEY"] == "abc"
+    assert os.environ["FOO_TESTE"] == "bar"
+    assert os.environ["JA_DEFINIDA"] == "antiga"
