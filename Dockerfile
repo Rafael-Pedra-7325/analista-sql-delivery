@@ -10,7 +10,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[grok]"
+RUN pip install --no-cache-dir ".[groq]"
 
 RUN analista-sql gerar-dados --saida /app/data/delivery.db
 
