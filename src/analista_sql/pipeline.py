@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import Config
 from .executor import Executor
 from .graficos import escolher_grafico, renderizar
-from .llm import GeradorClaude, GeradorSQL
+from .llm import GeradorGrok, GeradorSQL
 from .modelos import ErroExecucao, ErroProvedor, ErroValidacao, Resultado, Tentativa
 from .offline import GeradorOffline
 from .schema import carregar_catalogo, montar_contexto
@@ -18,11 +18,11 @@ from .schema import carregar_catalogo, montar_contexto
 def criar_gerador(provedor: str, config: Config, executor: Executor) -> GeradorSQL:
     if provedor == "offline":
         return GeradorOffline(carregar_catalogo(executor.meta))
-    if provedor == "claude":
-        return GeradorClaude(config.api_key, config.modelo)
+    if provedor == "grok":
+        return GeradorGrok(config.api_key, config.modelo)
     if provedor == "auto":
-        return GeradorClaude(config.api_key, config.modelo) if config.api_key else GeradorOffline(carregar_catalogo(executor.meta))
-    raise ValueError(f"Provedor desconhecido: {provedor!r} (use auto, claude ou offline)")
+        return GeradorGrok(config.api_key, config.modelo) if config.api_key else GeradorOffline(carregar_catalogo(executor.meta))
+    raise ValueError(f"Provedor desconhecido: {provedor!r} (use auto, grok ou offline)")
 
 
 def garantir_banco(config: Config) -> None:
