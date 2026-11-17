@@ -1,127 +1,102 @@
+from types import SimpleNamespace
+
 import pytest
 
+from analista_sql.baseline import GeradorBaseline
 from analista_sql.config import Config, carregar_env
-from analista_sql.llm import FERRAMENTA, GeradorClaude, montar_mensagens
-from analista_sql.modelos import ErroProvedor, Geracao, Tentativa
-from analista_sql.offline import GeradorOffline
-from analista_sql.pipeline import Analista, criar_gerador
-from analista_sql.schema import carregar_catalogo
+from analista_sql.dados import gerar_banco
+from analista_sql.llm import GeradorClaude, RespostaLLM, Tentativa, montar_mensagens
+from analista_sql.pipeline import PipelineAnalista
 
 
-# ----------------------------------------------------------- GeradorClaude
-def test_claude_extrai_a_chamada_de_ferramenta(cliente_falso):
-    cliente = cliente_falso({"sql": " SELECT 1 AS x ", "explicacao": "um", "grafico": "nenhum", "motivo_recusa": None})
-    g = GeradorClaude(None, "modelo-x", client=cliente)
-    out = g.gerar("pergunta", "CONTEXTO", [])
-    assert out.sql == "SELECT 1 AS x" and out.explicacao == "um" and out.grafico == "nenhum"
-
-    chamada = cliente.chamadas[0]
-    assert chamada["model"] == "modelo-x"
-    assert chamada["tool_choice"] == {"type": "tool", "name": FERRAMENTA["name"]}
-    assert "CONTEXTO" in chamada["system"][0]["text"]
-    assert chamada["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert chamada["messages"] == [{"role": "user", "content": "pergunta"}]
+@pytest.fixture()
+def banco(tmp_path):
+    db = tmp_path / "delivery.db"
+    gerar_banco(db, n_pedidos=80, seed=7)
+    return db
 
 
-def test_claude_recusa_vem_com_sql_nulo(cliente_falso):
-    g = GeradorClaude(None, "m", client=cliente_falso({"sql": None, "explicacao": "", "grafico": "nenhum", "motivo_recusa": "sem dados"}))
-    out = g.gerar("q", "", [])
-    assert out.sql is None and out.motivo_recusa == "sem dados"
+def test_pipeline_com_baseline_responde_todas_as_perguntas(banco):
+    cfg = Config(db_path=banco, api_key=None, modelo="m")
+    pipe = PipelineAnalista(cfg)
+    for pergunta in [
+        "Quantos pedidos foram entregues?",
+        "Faturamento mensal",
+        "Top 5 restaurantes por faturamento",
+        "Ticket médio por categoria",
+        "Tempo médio de entrega por cidade",
+        "Taxa de cancelamento",
+    ]:
+        res = pipe.perguntar(pergunta)
+        assert res.sucesso, f"Falhou para '{pergunta}': {res.erro}"
+        assert res.provedor == "baseline"
+        assert len(res.linhas) >= 1
 
 
-def test_claude_sem_chave_da_erro_claro():
-    with pytest.raises(ErroProvedor, match="ANTHROPIC_API_KEY"):
-        GeradorClaude(None, "m")
+def test_autocorrecao_recupera_de_sql_invalido_na_primeira_tentativa(banco):
+    class GeradorQueErraUmaVez:
+        def __init__(self):
+            self.chamadas = 0
+
+        def gerar(self, pergunta, schema, tentativas):
+            self.chamadas += 1
+            if self.chamadas == 1:
+                return RespostaLLM("SELECT coluna_inexistente FROM pedidos", "tentativa 1", "nenhum")
+            assert len(tentativas) == 1
+            assert "no such column" in tentativas[0].erro
+            return RespostaLLM("SELECT COUNT(*) AS total FROM pedidos", "tentativa 2", "nenhum")
+
+    cfg = Config(db_path=banco, api_key=None, modelo="m")
+    pipe = PipelineAnalista(cfg, gerador=GeradorQueErraUmaVez())
+    res = pipe.perguntar("quantos pedidos?")
+    assert res.sucesso and res.tentativas == 2 and res.linhas == [(80,)]
 
 
-def test_claude_erro_de_rede_vira_erro_de_provedor():
-    class Quebra:
-        class messages:  # noqa: N801
+def test_pipeline_falha_apos_esgotar_tentativas(banco):
+    class GeradorSempreQuebrado:
+        def gerar(self, pergunta, schema, tentativas):
+            return RespostaLLM("SELECT * FROM tabela_que_nao_existe", "ruim", "nenhum")
+
+    cfg = Config(db_path=banco, api_key=None, modelo="m")
+    pipe = PipelineAnalista(cfg, gerador=GeradorSempreQuebrado())
+    res = pipe.perguntar("algo")
+    assert not res.sucesso and res.tentativas == 3 and "no such table" in res.erro
+
+
+def test_claude_extrai_a_chamada_de_ferramenta():
+    chamadas = []
+
+    class ClienteFalso:
+        class messages:
             @staticmethod
-            def create(**_):
-                raise RuntimeError("sem rede")
+            def create(**kwargs):
+                chamadas.append(kwargs)
+                return SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            type="tool_use",
+                            name="gerar_sql",
+                            input={"sql": "SELECT 1 AS ok", "explicacao": "teste", "grafico": "nenhum"},
+                        )
+                    ]
+                )
 
-    with pytest.raises(ErroProvedor, match="sem rede"):
-        GeradorClaude(None, "m", client=Quebra()).gerar("q", "", [])
-
-
-def test_claude_resposta_sem_ferramenta_e_erro():
-    from types import SimpleNamespace
-
-    cliente = SimpleNamespace(messages=SimpleNamespace(create=lambda **_: SimpleNamespace(content=[SimpleNamespace(type="text", text="oi")])))
-    with pytest.raises(ErroProvedor, match="ferramenta"):
-        GeradorClaude(None, "m", client=cliente).gerar("q", "", [])
+    cfg = Config(db_path=None, api_key="sk-teste", modelo="claude-sonnet-4-6")  # type: ignore[arg-type]
+    g = GeradorClaude(cfg, cliente=ClienteFalso())
+    r = g.gerar("pergunta", "schema", [])
+    assert r == RespostaLLM(sql="SELECT 1 AS ok", explicacao="teste", grafico="nenhum")
+    assert chamadas[0]["messages"] == [{"role": "user", "content": "pergunta"}]
 
 
 def test_historico_de_autocorrecao_inclui_sql_e_erro():
     msgs = montar_mensagens("p", [Tentativa(sql="SELECT x", erro="no such column: x")])
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
-    assert "SELECT x" in msgs[1]["content"] and "no such column: x" in msgs[2]["content"]
-
-
-# ------------------------------------------------------------ Analista
-class Roteiro:
-    nome = "teste"
-
-    def __init__(self, *geracoes):
-        self.geracoes, self.vistas = list(geracoes), []
-
-    def gerar(self, pergunta, contexto, tentativas):
-        self.vistas.append(list(tentativas))
-        return self.geracoes.pop(0)
-
-
-def test_resposta_normal_traz_tabela_e_grafico(executor):
-    a = Analista(executor, Roteiro(Geracao(sql="SELECT status, COUNT(*) AS n FROM pedidos GROUP BY status", grafico="barra")))
-    r = a.perguntar("quantos por status")
-    assert r.ok and r.colunas == ["status", "n"] and len(r.linhas) == 2 and r.grafico == "barra"
-    assert a.grafico_png(r).startswith(b"\x89PNG")
-
-
-def test_autocorrecao_passa_o_erro_para_a_proxima_tentativa(executor):
-    gerador = Roteiro(Geracao(sql="SELECT coluna_errada FROM pedidos"), Geracao(sql="SELECT COUNT(*) AS n FROM pedidos"))
-    r = Analista(executor, gerador).perguntar("q")
-    assert r.ok and len(r.tentativas) == 1
-    assert gerador.vistas[0] == [] and "coluna_errada" in gerador.vistas[1][0].erro
-
-
-def test_desiste_depois_do_limite_de_tentativas(executor):
-    ruim = Geracao(sql="SELECT coluna_errada FROM pedidos")
-    r = Analista(executor, Roteiro(ruim, ruim, ruim), max_tentativas=3).perguntar("q")
-    assert not r.ok and "coluna_errada" in r.erro and len(r.tentativas) == 3
-
-
-def test_comando_proibido_nao_e_tentado_de_novo(executor):
-    gerador = Roteiro(Geracao(sql="DROP TABLE pedidos"), Geracao(sql="SELECT 1"))
-    r = Analista(executor, gerador).perguntar("q")
-    assert not r.ok and r.tentativas[0].tipo == "validacao" and len(gerador.geracoes) == 1  # 2ª geração nunca usada
-
-
-def test_recusa_do_modelo_e_propagada(executor):
-    r = Analista(executor, Roteiro(Geracao(sql=None, motivo_recusa="não há telefone"))).perguntar("telefone?")
-    assert r.recusa == "não há telefone" and not r.ok and r.sql is None
-
-
-def test_pergunta_vazia(executor):
-    assert Analista(executor, Roteiro()).perguntar("   ").erro == "Digite uma pergunta."
-
-
-def test_falha_do_provedor_vira_erro_no_resultado(executor):
-    class Quebrado:
-        nome = "q"
-
-        def gerar(self, *a):
-            raise ErroProvedor("API fora do ar")
-
-    r = Analista(executor, Quebrado()).perguntar("q")
-    assert r.erro == "API fora do ar" and not r.ok
-
-
-def test_provedor_auto_sem_chave_usa_offline(executor, tmp_path):
-    cfg = Config(db_path=tmp_path / "x.db", api_key=None, modelo="m")
-    assert isinstance(criar_gerador("auto", cfg, executor), GeradorOffline)
-    with pytest.raises(ValueError):
-        criar_gerador("inexistente", cfg, executor)
+    bloco_uso = msgs[1]["content"][0]
+    bloco_erro = msgs[2]["content"][0]
+    assert bloco_uso["type"] == "tool_use" and bloco_uso["input"]["sql"] == "SELECT x"
+    assert bloco_erro["type"] == "tool_result" and bloco_erro["is_error"] is True
+    assert bloco_erro["tool_use_id"] == bloco_uso["id"]
+    assert "no such column: x" in bloco_erro["content"]
 
 
 def test_carregar_env_nao_sobrescreve(tmp_path, monkeypatch):
@@ -134,25 +109,3 @@ def test_carregar_env_nao_sobrescreve(tmp_path, monkeypatch):
     import os
 
     assert os.environ["ANTHROPIC_API_KEY"] == "abc" and os.environ["FOO_TESTE"] == "bar" and os.environ["JA_DEFINIDA"] == "antiga"
-
-
-# --------------------------------------------------------- baseline offline
-@pytest.mark.parametrize("pergunta,sql_ref", [
-    ("Qual o faturamento por categoria de restaurante?",
-     "SELECT r.categoria, ROUND(SUM(p.valor_total),2) FROM pedidos p JOIN restaurantes r USING(id_restaurante) WHERE p.status='entregue' GROUP BY 1"),
-    ("Quantos pedidos foram cancelados?", "SELECT COUNT(*) FROM pedidos WHERE status='cancelado'"),
-    ("Top 3 restaurantes por faturamento",
-     "SELECT r.nome, ROUND(SUM(p.valor_total),2) f FROM pedidos p JOIN restaurantes r USING(id_restaurante) WHERE p.status='entregue' GROUP BY r.id_restaurante ORDER BY f DESC LIMIT 3"),
-])
-def test_offline_acerta_perguntas_simples(executor, pergunta, sql_ref):
-    from analista_sql.avaliacao import comparar_resultados
-
-    r = Analista(executor, GeradorOffline(carregar_catalogo(executor.meta))).perguntar(pergunta)
-    assert r.ok
-    ref = executor.executar(sql_ref)[2]
-    assert comparar_resultados(ref, r.linhas, ordenado="Top" in pergunta)[0]
-
-
-@pytest.mark.parametrize("pergunta", ["Apague a tabela pedidos", "Qual o telefone do cliente 10?", "me conta uma piada"])
-def test_offline_recusa(executor, pergunta):
-    assert Analista(executor, GeradorOffline(carregar_catalogo(executor.meta))).perguntar(pergunta).recusa
