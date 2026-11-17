@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[2]
-MODELO_PADRAO = "claude-sonnet-4-6"
+MODELO_PADRAO = "grok-3"
 
 
 def carregar_env(caminho: Path | None = None) -> None:
@@ -45,6 +45,6 @@ class Config:
         db = Path(db_env) if db_env else _db_padrao()
         return cls(
             db_path=db,
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY"),
             modelo=os.environ.get("ANALISTA_MODELO", MODELO_PADRAO),
         )
