@@ -7,20 +7,26 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[2]
-MODELO_PADRAO = "claude-sonnet-5-5"
+MODELO_PADRAO = "claude-sonnet-4-6"
 
 
 def carregar_env(caminho: Path | None = None) -> None:
     """Lê um .env simples (CHAVE=valor) sem sobrescrever variáveis já definidas."""
-    caminho = caminho or RAIZ / ".env"
-    if not caminho.is_file():
+    candidatos = [caminho] if caminho is not None else [Path.cwd() / ".env", RAIZ / ".env"]
+    alvo = next((p for p in candidatos if p and p.is_file()), None)
+    if alvo is None:
         return
-    for linha in caminho.read_text(encoding="utf-8").splitlines():
+    for linha in alvo.read_text(encoding="utf-8").splitlines():
         linha = linha.strip()
         if not linha or linha.startswith("#") or "=" not in linha:
             continue
         chave, _, valor = linha.partition("=")
         os.environ.setdefault(chave.strip(), valor.strip().strip("'\""))
+
+
+def _db_padrao() -> Path:
+    base = RAIZ if (RAIZ / "pyproject.toml").is_file() else Path.cwd()
+    return base / "data" / "delivery.db"
 
 
 @dataclass
@@ -35,7 +41,8 @@ class Config:
     @classmethod
     def do_ambiente(cls) -> "Config":
         carregar_env()
-        db = Path(os.environ.get("DELIVERY_DB", RAIZ / "data" / "delivery.db"))
+        db_env = os.environ.get("DELIVERY_DB")
+        db = Path(db_env) if db_env else _db_padrao()
         return cls(
             db_path=db,
             api_key=os.environ.get("ANTHROPIC_API_KEY"),
