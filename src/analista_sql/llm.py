@@ -1,50 +1,60 @@
-"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Claude (Anthropic API).
+"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Grok (xAI API).
 
-Usa tool use forçado (`tool_choice={"type": "tool", "name": "gerar_sql"}`) e prompt caching
-do contexto do esquema para garantir resposta estruturada (SQL, explicação, gráfico ou recusa).
+Usa function calling forçado (`tool_choice={"type": "function", "function": {"name": "gerar_sql"}}`)
+no endpoint compatível com OpenAI da xAI (`https://api.x.ai/v1`) para garantir resposta
+estruturada com SQL, explicação, sugestão de gráfico ou recusa.
 """
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from .config import MODELO_PADRAO
 from .modelos import ErroProvedor, Geracao, Tentativa
 
+XAI_BASE_URL = "https://api.x.ai/v1"
+
 FERRAMENTA = {
-    "name": "gerar_sql",
-    "description": (
-        "Gera uma única consulta SELECT em SQLite para responder à pergunta de negócio, "
-        "ou recusa quando a pergunta pede escrita, previsão ou dados inexistentes no esquema."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "sql": {
-                "type": ["string", "null"],
-                "description": (
-                    "Consulta SELECT (ou WITH ... SELECT) SQLite válida e somente leitura, "
-                    "ou null quando a pergunta deve ser recusada."
-                ),
+    "type": "function",
+    "function": {
+        "name": "gerar_sql",
+        "description": (
+            "Gera uma única consulta SELECT em SQLite para responder à pergunta de negócio, "
+            "ou recusa quando a pergunta pede escrita, previsão ou dados inexistentes no esquema."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": (
+                        "Consulta SELECT (ou WITH ... SELECT) SQLite válida e somente leitura, "
+                        "ou null quando a pergunta deve ser recusada."
+                    ),
+                },
+                "explicacao": {
+                    "type": "string",
+                    "description": "Resumo em 1 frase (português) do que a consulta calcula.",
+                },
+                "grafico": {
+                    "type": "string",
+                    "enum": ["nenhum", "barra", "linha", "dispersao"],
+                    "description": (
+                        "Visualização sugerida: 'linha' para séries temporais, 'barra' para "
+                        "categorias/rankings, 'dispersao' para duas métricas numéricas, 'nenhum' caso contrário."
+                    ),
+                },
+                "motivo_recusa": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Explicação curta em português quando sql for null; caso contrário, null.",
+                },
             },
-            "explicacao": {
-                "type": "string",
-                "description": "Resumo em 1 frase (português) do que a consulta calcula.",
-            },
-            "grafico": {
-                "type": "string",
-                "enum": ["nenhum", "barra", "linha", "dispersao"],
-                "description": (
-                    "Visualização sugerida: 'linha' para séries temporais, 'barra' para "
-                    "categorias/rankings, 'dispersao' para duas métricas numéricas, 'nenhum' caso contrário."
-                ),
-            },
-            "motivo_recusa": {
-                "type": ["string", "null"],
-                "description": "Explicação curta em português quando sql for null; caso contrário, null.",
-            },
+            "required": ["sql", "explicacao", "grafico"],
         },
-        "required": ["sql", "explicacao", "grafico"],
     },
 }
 
@@ -64,37 +74,88 @@ class GeradorSQL(Protocol):
     def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao: ...
 
 
-def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[str, Any]]:
-    """Histórico da conversa: pergunta + (tool_use falho, tool_result com erro) de cada tentativa."""
-    mensagens: list[dict[str, Any]] = [{"role": "user", "content": pergunta}]
+def montar_mensagens(pergunta: str, tentativas: list[Tentativa], contexto: str = "") -> list[dict[str, Any]]:
+    """Histórico da conversa no formato Chat Completions: system + user + (tool_calls, tool) de cada tentativa."""
+    mensagens: list[dict[str, Any]] = []
+    if contexto:
+        mensagens.append({"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{contexto}"})
+    mensagens.append({"role": "user", "content": pergunta})
     for idx, t in enumerate(tentativas, 1):
-        tool_id = f"toolu_tentativa_{idx}"
+        tool_id = f"call_tentativa_{idx}"
         mensagens.append({
             "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": tool_id,
-                "name": FERRAMENTA["name"],
-                "input": {"sql": t.sql, "explicacao": "", "grafico": "nenhum", "motivo_recusa": None},
-            }],
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": "gerar_sql",
+                        "arguments": json.dumps(
+                            {"sql": t.sql, "explicacao": "", "grafico": "nenhum", "motivo_recusa": None},
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
         })
         mensagens.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_id,
-                "content": (
-                    f"Essa consulta falhou com o erro: {t.erro}\n"
-                    "Corrija o SQL usando apenas tabelas e colunas do esquema e chame gerar_sql novamente."
-                ),
-                "is_error": True,
-            }],
+            "role": "tool",
+            "tool_call_id": tool_id,
+            "content": (
+                f"Essa consulta falhou com o erro: {t.erro}\n"
+                "Corrija o SQL usando apenas tabelas e colunas do esquema e chame gerar_sql novamente."
+            ),
         })
     return mensagens
 
 
-class GeradorClaude:
-    """Chama a API da Anthropic com tool use forçado e prompt caching do esquema."""
+class _ClienteHTTPXAI:
+    """Fallback leve via biblioteca padrão caso o pacote `openai` não esteja instalado."""
+
+    def __init__(self, api_key: str, base_url: str = XAI_BASE_URL) -> None:
+        self._api_key = api_key
+        self._url = f"{base_url.rstrip('/')}/chat/completions"
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs: Any) -> Any:
+        corpo = json.dumps(kwargs, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self._url,
+            data=corpo,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+                "User-Agent": "analista-sql-delivery/0.1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                dados = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detalhe = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detalhe}") from exc
+
+        msg = dados["choices"][0]["message"]
+        tool_calls = [
+            SimpleNamespace(
+                id=tc.get("id", ""),
+                type=tc.get("type", "function"),
+                function=SimpleNamespace(
+                    name=tc["function"]["name"],
+                    arguments=tc["function"]["arguments"],
+                ),
+            )
+            for tc in (msg.get("tool_calls") or [])
+        ]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=msg.get("content"), tool_calls=tool_calls))]
+        )
+
+
+class GeradorGrok:
+    """Chama a API da xAI (Grok) com function calling forçado."""
 
     def __init__(
         self,
@@ -103,49 +164,61 @@ class GeradorClaude:
         cliente: Any | None = None,
     ) -> None:
         self.modelo = modelo
-        self.nome = f"claude:{modelo}"
+        self.nome = f"grok:{modelo}"
         if cliente is not None:
             self._cliente = cliente
         else:
             if not api_key:
-                raise ErroProvedor("ANTHROPIC_API_KEY não configurada.")
+                raise ErroProvedor("XAI_API_KEY não configurada.")
             try:
-                import anthropic
-            except ImportError as exc:
-                raise ErroProvedor(
-                    "Pacote 'anthropic' não instalado. Rode: pip install -e \".[claude]\""
-                ) from exc
-            self._cliente = anthropic.Anthropic(api_key=api_key)
+                import openai
+
+                self._cliente = openai.OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+            except ImportError:
+                self._cliente = _ClienteHTTPXAI(api_key=api_key, base_url=XAI_BASE_URL)
 
     def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao:
         try:
-            resposta = self._cliente.messages.create(
+            resposta = self._cliente.chat.completions.create(
                 model=self.modelo,
-                max_tokens=1024,
-                system=[
-                    {
-                        "type": "text",
-                        "text": f"{SYSTEM_PROMPT}\n\n{contexto}",
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
+                max_tokens=2048,
+                temperature=0,
                 tools=[FERRAMENTA],
-                tool_choice={"type": "tool", "name": "gerar_sql"},
-                messages=montar_mensagens(pergunta, tentativas),
+                tool_choice={"type": "function", "function": {"name": "gerar_sql"}},
+                messages=montar_mensagens(pergunta, tentativas, contexto),
             )
         except Exception as exc:
-            raise ErroProvedor(f"Falha ao consultar a API da Anthropic: {exc}") from exc
+            raise ErroProvedor(f"Falha ao consultar a API do Grok (xAI): {exc}") from exc
 
-        for bloco in resposta.content:
-            if getattr(bloco, "type", None) == "tool_use" and bloco.name == "gerar_sql":
-                dados = bloco.input or {}
+        choices = getattr(resposta, "choices", None) or []
+        if not choices:
+            raise ErroProvedor("A API do Grok não retornou escolhas na resposta.")
+
+        mensagem = choices[0].message
+        for chamada in getattr(mensagem, "tool_calls", None) or []:
+            func = getattr(chamada, "function", None)
+            if func is not None and getattr(func, "name", None) == "gerar_sql":
+                raw_args = getattr(func, "arguments", "{}")
+                try:
+                    dados = raw_args if isinstance(raw_args, dict) else json.loads(raw_args or "{}")
+                except json.JSONDecodeError as exc:
+                    raise ErroProvedor(f"Argumentos JSON inválidos retornados pelo Grok: {exc}") from exc
+
                 raw_sql = dados.get("sql")
-                sql = None if raw_sql is None or not str(raw_sql).strip() else str(raw_sql).strip()
+                if raw_sql is None or str(raw_sql).strip().lower() in ("", "null", "none"):
+                    sql = None
+                else:
+                    sql = str(raw_sql).strip()
+
                 explicacao = str(dados.get("explicacao", "")).strip()
                 grafico = dados.get("grafico")
                 grafico_limpo = str(grafico).strip() if grafico else None
                 motivo = dados.get("motivo_recusa")
-                motivo_recusa = str(motivo).strip() if motivo else None
+                motivo_recusa = (
+                    None
+                    if motivo is None or str(motivo).strip().lower() in ("", "null", "none")
+                    else str(motivo).strip()
+                )
                 if sql is None and not motivo_recusa:
                     motivo_recusa = explicacao or "Pergunta fora do escopo dos dados disponíveis."
                 return Geracao(
@@ -154,4 +227,4 @@ class GeradorClaude:
                     grafico=grafico_limpo,
                     motivo_recusa=motivo_recusa,
                 )
-        raise ErroProvedor("O modelo Claude não retornou a chamada esperada da ferramenta gerar_sql.")
+        raise ErroProvedor("O modelo Grok não retornou a chamada esperada da ferramenta gerar_sql.")
