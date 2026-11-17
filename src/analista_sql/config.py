@@ -45,6 +45,6 @@ class Config:
         db = Path(db_env) if db_env else _db_padrao()
         return cls(
             db_path=db,
-            api_key=os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY"),
+            api_key=os.environ.get("GROQ_API_KEY"),
             modelo=os.environ.get("ANALISTA_MODELO", MODELO_PADRAO),
         )
