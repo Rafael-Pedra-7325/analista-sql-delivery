@@ -1,8 +1,8 @@
-"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Grok (xAI API).
+"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Groq (Llama 3.3 70B).
 
-Usa function calling forçado (`tool_choice={"type": "function", "function": {"name": "gerar_sql"}}`)
-no endpoint compatível com OpenAI da xAI (`https://api.x.ai/v1`) para garantir resposta
-estruturada com SQL, explicação, sugestão de gráfico ou recusa.
+Usa function calling forçado (`tool_choice="required"`) no endpoint compatível com OpenAI
+da Groq (`https://api.groq.com/openai/v1`) para garantir resposta estruturada com SQL,
+explicação, sugestão de gráfico ou recusa.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from .config import MODELO_PADRAO
 from .modelos import ErroProvedor, Geracao, Tentativa
 
-XAI_BASE_URL = "https://api.x.ai/v1"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 FERRAMENTA = {
     "type": "function",
@@ -30,7 +30,7 @@ FERRAMENTA = {
             "type": "object",
             "properties": {
                 "sql": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "type": ["string", "null"],
                     "description": (
                         "Consulta SELECT (ou WITH ... SELECT) SQLite válida e somente leitura, "
                         "ou null quando a pergunta deve ser recusada."
@@ -49,7 +49,7 @@ FERRAMENTA = {
                     ),
                 },
                 "motivo_recusa": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "type": ["string", "null"],
                     "description": "Explicação curta em português quando sql for null; caso contrário, null.",
                 },
             },
@@ -110,10 +110,10 @@ def montar_mensagens(pergunta: str, tentativas: list[Tentativa], contexto: str =
     return mensagens
 
 
-class _ClienteHTTPXAI:
+class _ClienteHTTPGroq:
     """Fallback leve via biblioteca padrão caso o pacote `openai` não esteja instalado."""
 
-    def __init__(self, api_key: str, base_url: str = XAI_BASE_URL) -> None:
+    def __init__(self, api_key: str, base_url: str = GROQ_BASE_URL) -> None:
         self._api_key = api_key
         self._url = f"{base_url.rstrip('/')}/chat/completions"
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
@@ -154,8 +154,8 @@ class _ClienteHTTPXAI:
         )
 
 
-class GeradorGrok:
-    """Chama a API da xAI (Grok) com function calling forçado."""
+class GeradorGroq:
+    """Chama a API gratuita da Groq com function calling forçado."""
 
     def __init__(
         self,
@@ -164,18 +164,18 @@ class GeradorGrok:
         cliente: Any | None = None,
     ) -> None:
         self.modelo = modelo
-        self.nome = f"grok:{modelo}"
+        self.nome = f"groq:{modelo}"
         if cliente is not None:
             self._cliente = cliente
         else:
             if not api_key:
-                raise ErroProvedor("XAI_API_KEY não configurada.")
+                raise ErroProvedor("GROQ_API_KEY não configurada.")
             try:
                 import openai
 
-                self._cliente = openai.OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+                self._cliente = openai.OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
             except ImportError:
-                self._cliente = _ClienteHTTPXAI(api_key=api_key, base_url=XAI_BASE_URL)
+                self._cliente = _ClienteHTTPGroq(api_key=api_key, base_url=GROQ_BASE_URL)
 
     def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao:
         try:
@@ -184,15 +184,15 @@ class GeradorGrok:
                 max_tokens=2048,
                 temperature=0,
                 tools=[FERRAMENTA],
-                tool_choice={"type": "function", "function": {"name": "gerar_sql"}},
+                tool_choice="required",
                 messages=montar_mensagens(pergunta, tentativas, contexto),
             )
         except Exception as exc:
-            raise ErroProvedor(f"Falha ao consultar a API do Grok (xAI): {exc}") from exc
+            raise ErroProvedor(f"Falha ao consultar a API da Groq: {exc}") from exc
 
         choices = getattr(resposta, "choices", None) or []
         if not choices:
-            raise ErroProvedor("A API do Grok não retornou escolhas na resposta.")
+            raise ErroProvedor("A API da Groq não retornou escolhas na resposta.")
 
         mensagem = choices[0].message
         for chamada in getattr(mensagem, "tool_calls", None) or []:
@@ -202,7 +202,7 @@ class GeradorGrok:
                 try:
                     dados = raw_args if isinstance(raw_args, dict) else json.loads(raw_args or "{}")
                 except json.JSONDecodeError as exc:
-                    raise ErroProvedor(f"Argumentos JSON inválidos retornados pelo Grok: {exc}") from exc
+                    raise ErroProvedor(f"Argumentos JSON inválidos retornados pela Groq: {exc}") from exc
 
                 raw_sql = dados.get("sql")
                 if raw_sql is None or str(raw_sql).strip().lower() in ("", "null", "none"):
@@ -227,4 +227,4 @@ class GeradorGrok:
                     grafico=grafico_limpo,
                     motivo_recusa=motivo_recusa,
                 )
-        raise ErroProvedor("O modelo Grok não retornou a chamada esperada da ferramenta gerar_sql.")
+        raise ErroProvedor("O modelo Groq não retornou a chamada esperada da ferramenta gerar_sql.")
