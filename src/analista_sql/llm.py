@@ -1,128 +1,137 @@
-"""Gerador de SQL com Claude (tool use) e a interface comum aos geradores."""
+"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Claude (Anthropic API).
+
+Usa tool use forçado (`tool_choice={"type": "tool", "name": "gerar_sql"}`) para garantir
+resposta estruturada com SQL, explicação curta e sugestão de gráfico.
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .modelos import ErroProvedor, Geracao, Tentativa
-
-PROMPT_SISTEMA = """\
-Você é um analista de dados sênior de uma plataforma brasileira de delivery de comida. \
-Sua tarefa é transformar a pergunta do usuário, escrita em português, em UMA consulta SQL \
-para o banco SQLite descrito abaixo.
-
-Regras:
-1. Dialeto SQLite. Apenas SELECT (ou WITH ... SELECT). Nunca modifique dados nem o esquema.
-2. Use somente as tabelas e colunas do esquema; nunca invente nomes. Para filtros de texto, copie a \
-grafia exata dos valores listados (com acentos).
-3. Siga à risca as regras de negócio e as convenções da resposta abaixo: elas definem o que \
-significam faturamento, ticket médio, taxa de cancelamento etc.
-4. Se a pergunta não puder ser respondida com estes dados (ex.: pede telefone, lucro, custo de \
-marketing, previsão) ou pedir para alterar/apagar dados, NÃO invente: chame a ferramenta com \
-sql = null e explique o motivo em motivo_recusa.
-5. Em perguntas ambíguas, escolha a interpretação mais comum e diga a premissa em `explicacao`.
-6. Responda sempre chamando a ferramenta `gerar_sql`. `explicacao` deve ter 1 ou 2 frases em português.
-7. Em `grafico`, sugira: 'barra' para comparar categorias, 'linha' para evolução no tempo, \
-'dispersao' para relação entre duas medidas numéricas, 'nenhum' para valor único ou lista sem \
-comparação.
-
-{contexto}
-"""
+from .config import Config
 
 FERRAMENTA = {
     "name": "gerar_sql",
-    "description": "Registra a consulta SQLite que responde à pergunta do usuário, ou recusa a pergunta.",
+    "description": (
+        "Gera uma única consulta SELECT em SQLite para responder à pergunta de negócio. "
+        "Nunca usa comandos de escrita nem multi-statements."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
             "sql": {
-                "type": ["string", "null"],
-                "description": "Consulta SQLite (somente leitura). null se a pergunta não puder ser respondida.",
+                "type": "string",
+                "description": "Consulta SELECT SQLite completa, válida e somente leitura.",
             },
             "explicacao": {
                 "type": "string",
-                "description": "1 a 2 frases em português: o que a consulta calcula e as premissas assumidas.",
+                "description": "Resumo em 1 frase (português) do que a consulta calcula.",
             },
             "grafico": {
                 "type": "string",
-                "enum": ["barra", "linha", "dispersao", "nenhum"],
-                "description": "Melhor tipo de gráfico para o resultado.",
-            },
-            "motivo_recusa": {
-                "type": ["string", "null"],
-                "description": "Quando sql é null, por que a pergunta não pode ser respondida.",
+                "enum": ["nenhum", "barra", "linha"],
+                "description": (
+                    "Tipo de visualização sugerida: 'linha' para séries temporais, "
+                    "'barra' para categorias/rankings, 'nenhum' para valor único ou tabela."
+                ),
             },
         },
         "required": ["sql", "explicacao", "grafico"],
     },
 }
 
+SYSTEM_PROMPT = """Você é um analista de dados sênior especializado em SQLite.
+Converta a pergunta do usuário em UMA única consulta SELECT para o banco descrito abaixo.
+
+Regras obrigatórias:
+- Gere APENAS SELECT (ou WITH ... SELECT). Nunca use INSERT, UPDATE, DELETE, DROP, ALTER, PRAGMA ou ATTACH.
+- Use somente as tabelas e colunas documentadas no schema.
+- Em SQLite, para datas use strftime('%Y-%m', coluna) ou date(coluna).
+- Prefira nomes de colunas claros em português (ex.: total_pedidos, receita_total) usando AS.
+- Sempre aplique um limite razoável (ex.: LIMIT 20) em rankings e listagens.
+- Se a pergunta for ambígua, faça a escolha mais útil para negócios e registre na explicação.
+
+Schema do banco:
+{schema}
+"""
+
+
+@dataclass
+class RespostaLLM:
+    sql: str
+    explicacao: str
+    grafico: str  # "nenhum" | "barra" | "linha"
+
+
+@dataclass
+class Tentativa:
+    sql: str
+    erro: str
+
 
 class GeradorSQL(Protocol):
-    nome: str
-
-    def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao: ...
+    def gerar(self, pergunta: str, schema: str, tentativas: list[Tentativa]) -> RespostaLLM: ...
 
 
-def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[str, str]]:
-    """Histórico da conversa: pergunta + (SQL falho, erro) de cada tentativa anterior."""
-    mensagens = [{"role": "user", "content": pergunta}]
-    for t in tentativas:
-        mensagens.append({"role": "assistant", "content": f"Consulta tentada:\n{t.sql}"})
+def montar_mensagens(pergunta: str, tentativas: list[Tentativa]) -> list[dict[str, Any]]:
+    """Histórico da conversa: pergunta + (tool_use falho, tool_result com erro) de cada tentativa."""
+    mensagens: list[dict[str, Any]] = [{"role": "user", "content": pergunta}]
+    for idx, t in enumerate(tentativas, 1):
+        tool_id = f"toolu_tentativa_{idx}"
+        mensagens.append({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_id,
+                "name": FERRAMENTA["name"],
+                "input": {"sql": t.sql, "explicacao": "", "grafico": "nenhum"},
+            }],
+        })
         mensagens.append({
             "role": "user",
-            "content": f"Essa consulta falhou com o erro: {t.erro}\n"
-                       "Corrija e chame a ferramenta gerar_sql novamente.",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": (
+                    f"Essa consulta falhou com o erro: {t.erro}\n"
+                    "Corrija e chame a ferramenta gerar_sql novamente."
+                ),
+                "is_error": True,
+            }],
         })
     return mensagens
 
 
 class GeradorClaude:
-    """Usa a API da Anthropic com tool use forçado, para receber a resposta já estruturada."""
+    """Chama a API da Anthropic com tool use forçado."""
 
-    def __init__(self, api_key: str | None, modelo: str, client: Any = None, max_tokens: int = 1500):
-        self.modelo = modelo
-        self.max_tokens = max_tokens
-        self.nome = f"claude:{modelo}"
-        if client is not None:
-            self.client = client
-            return
-        if not api_key:
-            raise ErroProvedor(
-                "ANTHROPIC_API_KEY não definida. Crie um arquivo .env (veja .env.example) "
-                "ou use --provedor offline."
-            )
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise ErroProvedor("Pacote 'anthropic' não instalado. Rode: pip install anthropic") from exc
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, config: Config, cliente: Any | None = None) -> None:
+        self.config = config
+        if cliente is not None:
+            self._cliente = cliente
+        else:
+            if not config.api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY não configurada.")
+            import anthropic  # import preguiçoso para não exigir rede/chave nos testes
 
-    def gerar(self, pergunta: str, contexto: str, tentativas: list[Tentativa]) -> Geracao:
-        try:
-            resposta = self.client.messages.create(
-                model=self.modelo,
-                max_tokens=self.max_tokens,
-                system=[{
-                    "type": "text",
-                    "text": PROMPT_SISTEMA.format(contexto=contexto),
-                    "cache_control": {"type": "ephemeral"},  # o esquema é igual em todas as perguntas
-                }],
-                tools=[FERRAMENTA],
-                tool_choice={"type": "tool", "name": FERRAMENTA["name"]},
-                messages=montar_mensagens(pergunta, tentativas),
-            )
-        except Exception as exc:  # erros de rede, autenticação, limite de uso...
-            raise ErroProvedor(f"Falha ao chamar a API da Anthropic: {exc}") from exc
+            self._cliente = anthropic.Anthropic(api_key=config.api_key)
 
+    def gerar(self, pergunta: str, schema: str, tentativas: list[Tentativa]) -> RespostaLLM:
+        resposta = self._cliente.messages.create(
+            model=self.config.modelo,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT.format(schema=schema),
+            tools=[FERRAMENTA],
+            tool_choice={"type": "tool", "name": "gerar_sql"},
+            messages=montar_mensagens(pergunta, tentativas),
+        )
         for bloco in resposta.content:
-            if getattr(bloco, "type", None) == "tool_use":
-                dados = dict(bloco.input or {})
-                sql = dados.get("sql")
-                return Geracao(
-                    sql=sql.strip() if isinstance(sql, str) and sql.strip() else None,
-                    explicacao=str(dados.get("explicacao") or ""),
-                    grafico=dados.get("grafico"),
-                    motivo_recusa=dados.get("motivo_recusa"),
+            if getattr(bloco, "type", None) == "tool_use" and bloco.name == "gerar_sql":
+                dados = bloco.input
+                return RespostaLLM(
+                    sql=str(dados.get("sql", "")).strip(),
+                    explicacao=str(dados.get("explicacao", "")).strip(),
+                    grafico=str(dados.get("grafico", "nenhum")).strip() or "nenhum",
                 )
-        raise ErroProvedor("A resposta do modelo não trouxe a chamada de ferramenta esperada.")
+        raise RuntimeError("O modelo Claude não retornou a chamada esperada da ferramenta gerar_sql.")
