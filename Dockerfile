@@ -8,15 +8,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Instala o pacote e o SDK da Anthropic
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[claude]"
+RUN pip install --no-cache-dir ".[grok]"
 
-# Pré-gera o banco sintético determinístico no build
 RUN analista-sql gerar-dados --saida /app/data/delivery.db
 
-# Roda como usuário sem privilégios de root
 RUN useradd --create-home appuser && chown -R appuser:appuser /app
 USER appuser
 
