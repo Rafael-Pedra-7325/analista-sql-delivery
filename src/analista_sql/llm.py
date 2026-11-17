@@ -1,4 +1,4 @@
-"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Groq (Llama 3.3 70B).
+"""Camada de LLM: traduz pergunta em linguagem natural para SQL via Groq (GPT-OSS 120B).
 
 Usa function calling forçado (`tool_choice="required"`) no endpoint compatível com OpenAI
 da Groq (`https://api.groq.com/openai/v1`) para garantir resposta estruturada com SQL,
@@ -181,7 +181,7 @@ class GeradorGroq:
         try:
             resposta = self._cliente.chat.completions.create(
                 model=self.modelo,
-                max_tokens=2048,
+                max_tokens=4096,
                 temperature=0,
                 tools=[FERRAMENTA],
                 tool_choice="required",
