@@ -100,12 +100,12 @@ def construir_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("perguntar", help="faz uma pergunta em português")
     q.add_argument("pergunta", nargs="+")
-    q.add_argument("--provedor", choices=["auto", "grok", "offline"], default="auto")
+    q.add_argument("--provedor", choices=["auto", "groq", "offline"], default="auto")
     q.add_argument("--grafico", metavar="ARQUIVO.png", help="salva o gráfico neste arquivo")
     q.set_defaults(func=cmd_perguntar)
 
     a = sub.add_parser("avaliar", help="mede a acurácia por execução no conjunto de avaliação")
-    a.add_argument("--provedor", choices=["auto", "grok", "offline"], default="auto")
+    a.add_argument("--provedor", choices=["auto", "groq", "offline"], default="auto")
     a.add_argument("--casos", default=None, help="arquivo JSON de casos (padrão: evals/casos.json)")
     a.add_argument("--saida", default="evals/relatorio.md", help="relatório em Markdown")
     a.add_argument("--json", default="evals/ultimo_resultado.json", help="resultado detalhado em JSON")
@@ -115,7 +115,7 @@ def construir_parser() -> argparse.ArgumentParser:
     w = sub.add_parser("web", help="abre a interface web local")
     w.add_argument("--host", default="127.0.0.1")
     w.add_argument("--porta", type=int, default=8000)
-    w.add_argument("--provedor", choices=["auto", "grok", "offline"], default="auto")
+    w.add_argument("--provedor", choices=["auto", "groq", "offline"], default="auto")
     w.set_defaults(func=cmd_web)
     return p
 
